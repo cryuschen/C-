@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import random
 import re
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -51,6 +53,7 @@ class 项目配置:
     阶段二引导分割迭代次数: int = 80
     阶段三迭代次数: int = 140
     Teacher_EMA系数: float = 0.995
+    真实审核窗口高度: int = 160
     学习率: float = 1.0e-3
     二值阈值: float = 0.50
     有效区顶部: int = 24
@@ -74,6 +77,10 @@ class 项目配置:
     @property
     def 阶段三目录(self) -> Path:
         return self.输出根目录 / "阶段三_Teacher-Student自训练"
+
+    @property
+    def 阶段四目录(self) -> Path:
+        return self.输出根目录 / "阶段四_独立真实无标签审核"
 
 
 配置 = 项目配置()
@@ -1338,11 +1345,11 @@ def 运行阶段三() -> None:
         writer.writeheader()
         writer.writerows(history)
     绘制自训练曲线(history, output / "阶段三_迭代次数损失与伪标签曲线.png")
-    绘制混淆矩阵(counts, output / "阶段三_EMA-Teacher合成验证混淆矩阵.png")
+    绘制混淆矩阵(counts, output / "阶段三_指数移动平均教师模型合成验证混淆矩阵.png")
     绘制三阶段指标对比(stage1, stage2, metrics, output / "阶段一至阶段三指标对比图.png")
 
     probability_dir = output / "原图裂缝概率图"
-    mask_dir = output / "原图二值裂缝Mask"
+    mask_dir = output / "原图二值裂缝掩膜"
     overlay_dir = output / "原图裂缝叠加图"
     comparison_dir = output / "原图识别四联对比图"
     for directory in (probability_dir, mask_dir, overlay_dir, comparison_dir):
@@ -1355,9 +1362,366 @@ def 运行阶段三() -> None:
         overlay = original.copy()
         overlay[binary] = 0.55 * overlay[binary] + 0.45 * np.array([1.0, 0.0, 0.0])
         转为PIL(概率着色(probability)).save(probability_dir / f"{path.stem}_裂缝概率图.png")
-        Image.fromarray(mask, mode="L").save(mask_dir / f"{path.stem}_二值裂缝Mask.png")
+        Image.fromarray(mask, mode="L").save(mask_dir / f"{path.stem}_二值裂缝掩膜.png")
         转为PIL(overlay).save(overlay_dir / f"{path.stem}_裂缝叠加图.png")
         保存最终预测对比(original, probability, comparison_dir / f"{path.stem}_裂缝识别四联对比图.png")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def 加载阶段三Teacher() -> tuple[轻量修复UNet, 轻量裂缝UNet]:
+    """加载阶段三EMA Teacher，保持阶段四与已输出预测一致。"""
+
+    repair, _ = 加载阶段二模型()
+    teacher = 轻量裂缝UNet(in_channels=4)
+    checkpoint = torch.load(
+        配置.阶段三目录 / "阶段三_EMA-Teacher模型.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    teacher.load_state_dict(checkpoint["模型参数"])
+    teacher.eval()
+    return repair, teacher
+
+
+def 文件SHA256(path: Path) -> str:
+    """计算文件指纹，用于证明原始JPG未被流水线覆盖。"""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def 选择审核窗口(probability: np.ndarray) -> list[dict[str, float | int | str]]:
+    """
+    对独立留出图像执行与模型输出无关的纵向系统抽样。
+
+    抽样位置不依赖预测概率，防止只挑选“模型擅长”或“高响应”区域
+    造成真实F1乐观偏差；概率与熵仅写入清单供误差分层分析。
+    """
+
+    height = probability.shape[0]
+    window_height = 配置.真实审核窗口高度
+    last = height - window_height
+    starts = np.linspace(配置.有效区顶部, last, num=8).round().astype(int).tolist()
+    candidates: list[dict[str, float | int | str]] = []
+    for index, y0 in enumerate(starts, start=1):
+        crop = probability[y0 : y0 + window_height]
+        flat = crop.reshape(-1)
+        top_count = max(1, int(flat.size * 0.05))
+        high_score = float(np.partition(flat, -top_count)[-top_count:].mean())
+        clipped = np.clip(flat, 1.0e-6, 1.0 - 1.0e-6)
+        entropy = float(np.mean(-(clipped * np.log(clipped) + (1.0 - clipped) * np.log(1.0 - clipped))))
+        candidates.append(
+            {
+                "纵向起点": y0,
+                "高响应得分": high_score,
+                "平均概率": float(flat.mean()),
+                "平均熵": entropy,
+                "审核类型": f"留出集系统抽样窗口{index:02d}",
+            }
+        )
+    return candidates
+
+
+def 保存审核参考四联图(
+    original: np.ndarray, probability: np.ndarray, path: Path
+) -> None:
+    """保存留出窗口的模型概率、掩膜和叠加图，供自动审核追溯。"""
+
+    binary = probability >= 配置.二值阈值
+    mask = np.repeat(np.where(binary, 0, 255)[..., None], 3, axis=2).astype(np.float32) / 255.0
+    overlay = original.copy()
+    overlay[binary] = 0.55 * overlay[binary] + 0.45 * np.array([1.0, 0.0, 0.0])
+    panels = [original, 概率着色(probability), mask, overlay]
+    labels = ["原始留出窗口", "教师模型概率", "固定阈值模型掩膜", "模型叠加结果"]
+    panel_width = original.shape[1]
+    panel_height = original.shape[0]
+    gap, label_height = 16, 46
+    canvas = Image.new("RGB", (4 * panel_width + 5 * gap, panel_height + label_height), "white")
+    draw = ImageDraw.Draw(canvas)
+    font = 加载中文字体(15)
+    for index, (panel, label) in enumerate(zip(panels, labels)):
+        left = gap + index * (panel_width + gap)
+        canvas.paste(转为PIL(panel), (left, label_height))
+        draw.text((left, 13), label, fill="#203A4F", font=font)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+
+
+def 绘制无标签审核诊断(rows: Sequence[dict[str, object]], path: Path) -> None:
+    """将真实留出窗口的预测分布与稳定性分开展示。"""
+
+    x = np.arange(1, len(rows) + 1)
+    positive = [float(row["预测裂缝像素比例"]) for row in rows]
+    uncertain = [float(row["不确定像素比例"]) for row in rows]
+    light_mae = [float(row["光度扰动概率差平均值"]) for row in rows]
+    shift_mae = [float(row["周期平移概率差平均值"]) for row in rows]
+    fig, axes = plt.subplots(2, 1, figsize=(10.2, 7.0), dpi=150, sharex=True)
+    axes[0].plot(x, positive, color="#2F6B9A", marker="o", linewidth=1.8, label="预测裂缝像素比例")
+    axes[0].plot(x, uncertain, color="#D69E2E", marker="s", linewidth=1.8, label="不确定像素比例")
+    axes[0].set_ylabel("像素比例")
+    axes[0].set_ylim(0.0, max(0.10, max(positive + uncertain) * 1.15))
+    axes[0].grid(axis="y", color="#D9DEE3", linewidth=0.7)
+    axes[0].legend(frameon=False, ncol=2)
+    axes[1].plot(x, light_mae, color="#52606D", marker="o", linewidth=1.8, label="光度扰动一致性误差")
+    axes[1].plot(x, shift_mae, color="#7C9EB2", marker="s", linewidth=1.8, label="周期平移一致性误差")
+    axes[1].set_ylabel("概率平均绝对差")
+    axes[1].set_xlabel("独立留出窗口序号")
+    axes[1].set_xticks(x)
+    axes[1].grid(axis="y", color="#D9DEE3", linewidth=0.7)
+    axes[1].legend(frameon=False, ncol=2)
+    fig.suptitle("独立真实留出集无标签自动审核")
+    fig.text(0.5, 0.01, "样本=图1-9和图1-10的16个系统抽样窗口；该图是稳定性诊断，不是真实精度", ha="center", fontsize=9)
+    fig.tight_layout(rect=(0, 0.04, 1, 0.96))
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def 绘制无标签审核汇总(summary: dict[str, float], path: Path) -> None:
+    """以单位一致的比例指标绘制自动审核汇总图。"""
+
+    names = ["裂缝预测比例", "不确定像素比例", "高置信像素比例", "双阈值稳定度"]
+    keys = ["平均预测裂缝像素比例", "平均不确定像素比例", "平均高置信像素比例", "平均双阈值稳定度"]
+    values = [summary[key] for key in keys]
+    fig, ax = plt.subplots(figsize=(8.6, 5.0), dpi=150)
+    bars = ax.bar(names, values, color="#2F6B9A", edgecolor="#203A4F")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("比例或交并比")
+    ax.set_title("真实留出集自动审核汇总")
+    ax.grid(axis="y", color="#D9DEE3", linewidth=0.7)
+    for bar, value in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, value + 0.02, f"{value:.3f}", ha="center")
+    fig.text(0.5, 0.01, "无人工真值；指标表示模型响应与稳定性，不代表F1或IoU精度", ha="center", fontsize=9)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def 绘制合成验证趋势(阶段指标: list[dict[str, float]], path: Path) -> None:
+    """单独展示前三阶段的合成验证趋势，不与真实审核数据混画。"""
+
+    names = ["合成监督", "修复引导", "Teacher"]
+    series = [
+        ("精确率", "精确率Precision", "#2F6B9A"),
+        ("召回率", "召回率Recall", "#D69E2E"),
+        ("F1", "F1分数", "#52606D"),
+        ("IoU", "交并比IoU", "#7C9EB2"),
+    ]
+    x = np.arange(3)
+    fig, ax = plt.subplots(figsize=(8.2, 5.0), dpi=150)
+    for label, key, color in series:
+        ax.plot(x, [stage[key] for stage in 阶段指标], marker="o", linewidth=2, label=label, color=color)
+    ax.set_xticks(x, labels=names)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("指标值")
+    ax.set_title("前三阶段合成验证指标趋势")
+    ax.grid(axis="y", color="#D9DEE3", linewidth=0.7)
+    ax.legend(frameon=False, ncol=4)
+    fig.text(0.5, 0.01, "数据集=在线合成裂缝验证集；真实留出集只做无标签稳定性审核", ha="center", fontsize=9)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def 运行阶段四() -> None:
+    """
+    对独立真实留出图像执行完全自动的无标签稳定性审核。
+
+    本阶段不需要人工标注。无真值时不计算真实F1，也不将稳定性指标
+    伪装成分割精度。
+    """
+
+    设置随机种子(配置.随机种子)
+    paths = 获取输入图像()
+    audit_paths = paths[8:]
+    output = 配置.阶段四目录
+    # 阶段四产物全部由程序生成，重跑时清除旧版本的人工标注入口。
+    if output.exists():
+        shutil.rmtree(output)
+    raw_dir = output / "独立留出原图窗口"
+    reference_dir = output / "模型自动诊断四联图"
+    probability_dir = output / "模型概率数值图"
+    final_mask_dir = output / "最终二值裂缝图"
+    final_comparison_dir = output / "最终裂缝识别对比图"
+    for directory in (
+        raw_dir,
+        reference_dir,
+        probability_dir,
+        final_mask_dir,
+        final_comparison_dir,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    repair, teacher = 加载阶段三Teacher()
+    audit_records: list[dict[str, object]] = []
+    audit_index = 1
+    for image_path in audit_paths:
+        original = 读取RGB(image_path)
+        probability = 滑窗预测整图(repair, teacher, original)
+        # 温和光度扰动不改变几何位置，用于检查预测光度稳定性。
+        light_image = np.clip(original * 1.04 + 0.01, 0.0, 1.0)
+        light_probability = 滑窗预测整图(repair, teacher, light_image)
+        # 横向周期平移后再反向对齐，检查360°展开边界的等变性。
+        shift = original.shape[1] // 4
+        shifted_image = np.roll(original, shift, axis=1)
+        shifted_probability = np.roll(
+            滑窗预测整图(repair, teacher, shifted_image), -shift, axis=1
+        )
+        repaired = 滑窗修复整图(repair, original)
+        residual = np.mean(np.abs(original - repaired), axis=2)
+        periodic_seam_difference = float(np.mean(np.abs(probability[:, 0] - probability[:, -1])))
+        for candidate in 选择审核窗口(probability):
+            y0 = int(candidate["纵向起点"])
+            y1 = y0 + 配置.真实审核窗口高度
+            category = str(candidate["审核类型"])
+            audit_id = f"审核{audit_index:03d}_{image_path.stem}_{category}_纵向{y0:04d}-{y1 - 1:04d}"
+            raw_crop = original[y0:y1]
+            probability_crop = probability[y0:y1]
+            light_crop = light_probability[y0:y1]
+            shifted_crop = shifted_probability[y0:y1]
+            residual_crop = residual[y0:y1]
+            clipped = np.clip(probability_crop, 1.0e-6, 1.0 - 1.0e-6)
+            entropy = -(clipped * np.log(clipped) + (1.0 - clipped) * np.log(1.0 - clipped))
+            low_threshold_mask = probability_crop >= 0.45
+            high_threshold_mask = probability_crop >= 0.55
+            union = int(np.logical_or(low_threshold_mask, high_threshold_mask).sum())
+            threshold_stability = (
+                float(np.logical_and(low_threshold_mask, high_threshold_mask).sum() / union)
+                if union > 0
+                else 1.0
+            )
+            flat_probability = probability_crop.reshape(-1)
+            flat_residual = residual_crop.reshape(-1)
+            residual_correlation = (
+                float(np.corrcoef(flat_probability, flat_residual)[0, 1])
+                if np.std(flat_probability) > 1.0e-8 and np.std(flat_residual) > 1.0e-8
+                else 0.0
+            )
+            转为PIL(raw_crop).save(raw_dir / f"{audit_id}_独立留出原图.png")
+            Image.fromarray(np.round(probability_crop * 255.0).astype(np.uint8), mode="L").save(
+                probability_dir / f"{audit_id}_模型概率数值图.png"
+            )
+            保存审核参考四联图(
+                raw_crop,
+                probability_crop,
+                reference_dir / f"{audit_id}_模型自动诊断四联图.png",
+            )
+            audit_records.append(
+                {
+                    "审核ID": audit_id,
+                    "原始图像": image_path.name,
+                    "审核类型": category,
+                    "纵向起点_含": y0,
+                    "纵向终点_不含": y1,
+                    "窗口宽": original.shape[1],
+                    "窗口高": raw_crop.shape[0],
+                    "模型平均概率": float(candidate["平均概率"]),
+                    "模型平均熵": float(candidate["平均熵"]),
+                    "预测裂缝像素比例": float(np.mean(probability_crop >= 配置.二值阈值)),
+                    "不确定像素比例": float(np.mean((probability_crop >= 0.35) & (probability_crop <= 0.65))),
+                    "高置信像素比例": float(np.mean((probability_crop <= 0.10) | (probability_crop >= 0.90))),
+                    "平均像素熵": float(entropy.mean()),
+                    "光度扰动概率差平均值": float(np.mean(np.abs(probability_crop - light_crop))),
+                    "周期平移概率差平均值": float(np.mean(np.abs(probability_crop - shifted_crop))),
+                    "双阈值稳定度": threshold_stability,
+                    "修复残差平均值": float(residual_crop.mean()),
+                    "预测概率与修复残差相关系数": residual_correlation,
+                    "整图周期边界概率差": periodic_seam_difference,
+                }
+            )
+            audit_index += 1
+
+    manifest_path = output / "独立真实无标签审核逐窗口数据.csv"
+    with manifest_path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=list(audit_records[0]))
+        writer.writeheader()
+        writer.writerows(audit_records)
+
+    汇总 = {
+        "平均预测裂缝像素比例": float(np.mean([row["预测裂缝像素比例"] for row in audit_records])),
+        "平均不确定像素比例": float(np.mean([row["不确定像素比例"] for row in audit_records])),
+        "平均高置信像素比例": float(np.mean([row["高置信像素比例"] for row in audit_records])),
+        "平均像素熵": float(np.mean([row["平均像素熵"] for row in audit_records])),
+        "平均光度扰动概率差": float(np.mean([row["光度扰动概率差平均值"] for row in audit_records])),
+        "平均周期平移概率差": float(np.mean([row["周期平移概率差平均值"] for row in audit_records])),
+        "平均双阈值稳定度": float(np.mean([row["双阈值稳定度"] for row in audit_records])),
+        "平均修复残差": float(np.mean([row["修复残差平均值"] for row in audit_records])),
+        "平均概率残差相关系数": float(np.mean([row["预测概率与修复残差相关系数"] for row in audit_records])),
+        "平均周期边界概率差": float(np.mean([row["整图周期边界概率差"] for row in audit_records])),
+    }
+    绘制无标签审核诊断(audit_records, output / "独立真实留出集无标签自动审核诊断图.png")
+    绘制无标签审核汇总(汇总, output / "真实留出集自动审核汇总图.png")
+
+    stage1 = json.loads((配置.阶段一目录 / "阶段一_合成验证指标.json").read_text(encoding="utf-8"))["指标"]
+    stage2 = json.loads((配置.阶段二目录 / "阶段二_异常修复与分割指标.json").read_text(encoding="utf-8"))["阶段二修复引导分割指标"]
+    stage3 = json.loads((配置.阶段三目录 / "阶段三_Teacher-Student训练指标.json").read_text(encoding="utf-8"))["合成验证指标"]
+    绘制合成验证趋势([stage1, stage2, stage3], output / "前三阶段合成验证指标趋势图.png")
+    summary_rows: list[dict[str, object]] = []
+    for stage_name, metrics in [
+        ("阶段一_合成裂缝监督", stage1),
+        ("阶段二_异常修复引导", stage2),
+        ("阶段三_Teacher-Student", stage3),
+    ]:
+        summary_rows.append({"阶段": stage_name, "评价数据": "合成裂缝验证集", "状态": "已完成", **metrics})
+    summary_rows.append(
+        {
+            "阶段": "阶段四_独立真实审核",
+            "评价数据": "真实无标签留出集",
+            "状态": "全自动无标签审核已完成_无真值故精度指标不可定义",
+            **{key: None for key in stage1},
+        }
+    )
+    with (output / "四阶段评价指标汇总.csv").open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=list(summary_rows[0]))
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    mask_validation: list[dict[str, object]] = []
+    for image_path in paths:
+        mask_path = 配置.阶段三目录 / "原图二值裂缝掩膜" / f"{image_path.stem}_二值裂缝掩膜.png"
+        comparison_path = 配置.阶段三目录 / "原图识别四联对比图" / f"{image_path.stem}_裂缝识别四联对比图.png"
+        with Image.open(mask_path) as mask_image:
+            values = sorted(np.unique(np.asarray(mask_image)).tolist())
+            validation_passed = mask_image.size == (244, 1350) and mask_image.mode == "L" and set(values).issubset({0, 255})
+            mask_validation.append(
+                {
+                    "原图": image_path.name,
+                    "原图SHA256": 文件SHA256(image_path),
+                    "预测Mask": mask_path.name,
+                    "Mask尺寸": list(mask_image.size),
+                    "Mask模式": mask_image.mode,
+                    "Mask像素值": values,
+                    "校验通过": validation_passed,
+                }
+            )
+        if not validation_passed:
+            raise RuntimeError(f"{mask_path.name}未通过最终发布校验。")
+        # 阶段三的候选预测经阶段四审核后，才复制到最终成果目录。
+        shutil.copy2(mask_path, final_mask_dir / f"{image_path.stem}_最终二值裂缝图.png")
+        shutil.copy2(
+            comparison_path,
+            final_comparison_dir / f"{image_path.stem}_最终裂缝识别对比图.png",
+        )
+    report = {
+        "阶段": "阶段四_独立真实留出集全自动无标签审核",
+        "审核策略": "仅使用未参与Teacher-Student真实无标签训练的图1-9和图1-10；每图等距抽取8个窗口，自动计算预测分布、不确定性、光度一致性、周期平移一致性、双阈值稳定性和修复残差关联",
+        "Teacher-Student真实无标签训练图像": [path.name for path in paths[:8]],
+        "独立留出审核图像": [path.name for path in audit_paths],
+        "审核窗口数": len(audit_records),
+        "人工标注需求": "不需要",
+        "评价状态": "全自动无标签审核已完成",
+        "二值化阈值": 配置.二值阈值,
+        "独立真实无标签诊断汇总": 汇总,
+        "真实F1分数": None,
+        "真实混淆矩阵": None,
+        "最终二值裂缝图目录": str(final_mask_dir),
+        "最终裂缝识别对比图目录": str(final_comparison_dir),
+        "说明": "本阶段完全自动，不需要人工标注。无真值时F1和混淆矩阵在数学上不可定义；上述结果是稳定性与不确定性诊断，不是真实精度。",
+        "原图与预测Mask校验": mask_validation,
+    }
+    保存JSON(report, output / "阶段四_全自动无标签审核结果.json")
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
@@ -1369,6 +1733,7 @@ def 构建命令行() -> argparse.ArgumentParser:
     subparsers.add_parser("阶段一", help="运行合成裂缝监督阶段")
     subparsers.add_parser("阶段二", help="运行异常修复与修复引导分割阶段")
     subparsers.add_parser("阶段三", help="运行Teacher-Student真实无标签自训练阶段")
+    subparsers.add_parser("阶段四", help="运行独立真实留出集全自动无标签审核")
     return parser
 
 
@@ -1380,6 +1745,8 @@ def main() -> None:
         运行阶段二()
     elif args.command == "阶段三":
         运行阶段三()
+    elif args.command == "阶段四":
+        运行阶段四()
 
 
 if __name__ == "__main__":
