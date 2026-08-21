@@ -49,6 +49,8 @@ class 项目配置:
     阶段一验证样本数: int = 48
     阶段二修复迭代次数: int = 100
     阶段二引导分割迭代次数: int = 80
+    阶段三迭代次数: int = 140
+    Teacher_EMA系数: float = 0.995
     学习率: float = 1.0e-3
     二值阈值: float = 0.50
     有效区顶部: int = 24
@@ -68,6 +70,10 @@ class 项目配置:
     @property
     def 阶段二目录(self) -> Path:
         return self.输出根目录 / "阶段二_异常修复"
+
+    @property
+    def 阶段三目录(self) -> Path:
+        return self.输出根目录 / "阶段三_Teacher-Student自训练"
 
 
 配置 = 项目配置()
@@ -1011,6 +1017,350 @@ def 运行阶段二() -> None:
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
+def 加载阶段二模型() -> tuple[轻量修复UNet, 轻量裂缝UNet]:
+    """加载阶段二冻结修复网络和四通道分割网络。"""
+
+    repair = 轻量修复UNet()
+    repair_checkpoint = torch.load(
+        配置.阶段二目录 / "阶段二_异常修复模型.pt", map_location="cpu", weights_only=False
+    )
+    repair.load_state_dict(repair_checkpoint["模型参数"])
+    repair.eval()
+    segmentation = 轻量裂缝UNet(in_channels=4)
+    segmentation_checkpoint = torch.load(
+        配置.阶段二目录 / "阶段二_修复引导分割模型.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    segmentation.load_state_dict(segmentation_checkpoint["模型参数"])
+    return repair, segmentation
+
+
+def 生成真实批次(generator: 在线合成批次, batch_size: int) -> Tensor:
+    """只从原图裁取无标签图块，不进行裂缝合成。"""
+
+    patches: list[np.ndarray] = []
+    for _ in range(batch_size):
+        patch, _, _, _ = generator.获取图块()
+        patches.append(patch.transpose(2, 0, 1))
+    return torch.from_numpy(np.stack(patches))
+
+
+def 弱增强(images: Tensor) -> Tensor:
+    """Teacher使用的温和光度扰动，不改变裂缝几何位置。"""
+
+    batch = images.shape[0]
+    brightness = torch.empty(batch, 1, 1, 1).uniform_(-0.025, 0.025)
+    contrast = torch.empty(batch, 1, 1, 1).uniform_(0.96, 1.04)
+    noise = torch.randn_like(images) * 0.004
+    return torch.clamp(images * contrast + brightness + noise, 0.0, 1.0)
+
+
+def 强增强(images: Tensor) -> Tensor:
+    """Student使用的较强光度、噪声和局部遮挡扰动。"""
+
+    batch, _, height, width = images.shape
+    brightness = torch.empty(batch, 1, 1, 1).uniform_(-0.07, 0.07)
+    contrast = torch.empty(batch, 1, 1, 1).uniform_(0.86, 1.14)
+    result = torch.clamp(images * contrast + brightness + torch.randn_like(images) * 0.018, 0.0, 1.0)
+    for index in range(batch):
+        if random.random() < 0.45:
+            box_h = random.randint(10, 28)
+            box_w = random.randint(8, 24)
+            y0 = random.randint(0, height - box_h)
+            x0 = random.randint(0, width - box_w)
+            result[index, :, y0 : y0 + box_h, x0 : x0 + box_w] = images[index].mean()
+    return result
+
+
+def 生成伪标签(
+    probabilities: Tensor,
+    residual: Tensor,
+) -> tuple[Tensor, Tensor, dict[str, float]]:
+    """结合Teacher置信度、熵和修复残差生成正、负、忽略三状态伪标签。"""
+
+    flat_prob = probabilities.detach().flatten()
+    flat_residual = residual.detach().flatten()
+    positive_threshold = max(0.72, float(torch.quantile(flat_prob, 0.992).item()))
+    negative_threshold = min(0.18, float(torch.quantile(flat_prob, 0.25).item()))
+    residual_threshold = float(torch.quantile(flat_residual, 0.72).item())
+    entropy = -probabilities * torch.log(probabilities + 1.0e-6) - (
+        1.0 - probabilities
+    ) * torch.log(1.0 - probabilities + 1.0e-6)
+    positive = (probabilities >= positive_threshold) & (residual >= residual_threshold) & (entropy < 0.58)
+    negative = (probabilities <= negative_threshold) & (entropy < 0.48)
+    valid = positive | negative
+    labels = positive.float()
+    total = float(probabilities.numel())
+    stats = {
+        "正伪标签比例": float(positive.sum().item()) / total,
+        "负伪标签比例": float(negative.sum().item()) / total,
+        "忽略比例": 1.0 - float(valid.sum().item()) / total,
+        "平均预测熵": float(entropy.mean().item()),
+        "正类概率阈值": positive_threshold,
+        "负类概率阈值": negative_threshold,
+        "残差阈值": residual_threshold,
+    }
+    return labels, valid.float(), stats
+
+
+def 伪标签损失(logits: Tensor, labels: Tensor, valid: Tensor) -> Tensor:
+    """仅在可信区域计算加权BCE，避免大量背景淹没少量正伪标签。"""
+
+    loss = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
+    class_weight = 1.0 + 4.0 * labels
+    return (loss * class_weight * valid).sum() / (valid.sum() + 1.0)
+
+
+def EMA更新(teacher: nn.Module, student: nn.Module, alpha: float) -> None:
+    """使用Student参数的指数滑动平均更新Teacher，不参与反向传播。"""
+
+    with torch.no_grad():
+        for teacher_parameter, student_parameter in zip(teacher.parameters(), student.parameters()):
+            teacher_parameter.mul_(alpha).add_(student_parameter, alpha=1.0 - alpha)
+
+
+def 绘制自训练曲线(rows: Sequence[dict[str, float | int]], path: Path) -> None:
+    """上图展示三类损失，下图展示伪标签覆盖率与平均熵。"""
+
+    x = [int(row["迭代次数"]) for row in rows]
+    fig, axes = plt.subplots(2, 1, figsize=(8.8, 8.0), dpi=150, sharex=True)
+    axes[0].plot(x, [float(row["总损失"]) for row in rows], color="#2F6B9A", label="总损失")
+    axes[0].plot(x, [float(row["合成监督损失"]) for row in rows], color="#D39C2C", label="合成监督损失")
+    axes[0].plot(x, [float(row["真实伪标签损失"]) for row in rows], color="#6B7280", label="真实伪标签损失")
+    axes[0].set_ylabel("损失")
+    axes[0].set_title("阶段三Teacher-Student自训练损失")
+    axes[0].grid(axis="y", color="#D9DEE3", linewidth=0.7)
+    axes[0].legend(frameon=False, ncol=3)
+    axes[1].plot(x, [float(row["正伪标签比例"]) for row in rows], color="#2F6B9A", label="正伪标签比例")
+    axes[1].plot(x, [float(row["负伪标签比例"]) for row in rows], color="#D39C2C", label="负伪标签比例")
+    axes[1].plot(x, [float(row["平均预测熵"]) for row in rows], color="#6B7280", linestyle="--", label="平均预测熵")
+    axes[1].set_xlabel("迭代次数")
+    axes[1].set_ylabel("比例或熵")
+    axes[1].set_ylim(0.0, 1.0)
+    axes[1].grid(axis="y", color="#D9DEE3", linewidth=0.7)
+    axes[1].legend(frameon=False, ncol=3)
+    fig.text(0.5, 0.01, "真实图像无人工标签；中等置信像素不参与伪标签损失", ha="center", fontsize=9)
+    fig.tight_layout(rect=(0, 0.035, 1, 1))
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def 绘制三阶段指标对比(stage1: dict[str, float], stage2: dict[str, float], stage3: dict[str, float], path: Path) -> None:
+    """比较三阶段在相同定义合成验证集上的核心指标。"""
+
+    names = ["精确率", "召回率", "F1", "IoU"]
+    keys = ["精确率Precision", "召回率Recall", "F1分数", "交并比IoU"]
+    x = np.arange(len(names))
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(9.2, 5.1), dpi=150)
+    series = [
+        ("阶段一合成监督", stage1, "#AFC8DA", "#2F6B9A", -width),
+        ("阶段二修复引导", stage2, "#E5C273", "#8A6415", 0.0),
+        ("阶段三EMA Teacher", stage3, "#9AA2AA", "#4B5563", width),
+    ]
+    for label, metrics, color, edge, offset in series:
+        bars = ax.bar(x + offset, [metrics[key] for key in keys], width, label=label, color=color, edgecolor=edge)
+        for bar in bars:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.015, f"{bar.get_height():.3f}", ha="center", fontsize=7.5)
+    ax.set_xticks(x, names)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("指标值")
+    ax.set_title("三个阶段的合成验证指标对比")
+    ax.grid(axis="y", color="#D9DEE3", linewidth=0.7)
+    ax.legend(frameon=False, ncol=3)
+    fig.text(0.5, 0.01, "合成验证用于模型消融；真实F1必须由阶段四新审核标签计算", ha="center", fontsize=9)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def 滑窗预测整图(
+    repair_model: 轻量修复UNet,
+    segmentation_model: 轻量裂缝UNet,
+    image: np.ndarray,
+) -> np.ndarray:
+    """对完整360°展开图进行周期滑窗概率预测并融合重叠区域。"""
+
+    size = 配置.图块尺寸
+    stride = size // 2
+    height, width = image.shape[:2]
+    y_starts = list(range(0, max(1, height - size + 1), stride))
+    if not y_starts or y_starts[-1] != height - size:
+        y_starts.append(height - size)
+    x_starts = list(range(0, width, stride))
+    accumulator = np.zeros((height, width), dtype=np.float32)
+    weights = np.zeros((height, width), dtype=np.float32)
+    repair_model.eval()
+    segmentation_model.eval()
+    with torch.no_grad():
+        for y0 in y_starts:
+            for x0 in x_starts:
+                patch = 循环裁剪图块(image, x0, y0, size)
+                tensor = torch.from_numpy(patch.transpose(2, 0, 1)[None])
+                repaired = repair_model(tensor)
+                probability = torch.sigmoid(
+                    segmentation_model(构造修复引导输入(tensor, repaired))
+                )[0, 0].cpu().numpy()
+                for local_x in range(size):
+                    global_x = (x0 + local_x) % width
+                    accumulator[y0 : y0 + size, global_x] += probability[:, local_x]
+                    weights[y0 : y0 + size, global_x] += 1.0
+    probability = accumulator / np.maximum(weights, 1.0)
+    probability[: 配置.有效区顶部] = 0.0
+    return np.clip(probability, 0.0, 1.0)
+
+
+def 概率着色(probability: np.ndarray) -> np.ndarray:
+    """将裂缝概率映射为黑—橙—白热力图。"""
+
+    return 残差着色(probability / 6.0)
+
+
+def 保存最终预测对比(original: np.ndarray, probability: np.ndarray, path: Path) -> None:
+    """保存原图、概率、二值Mask和红色叠加四联对比图。"""
+
+    binary = probability >= 配置.二值阈值
+    mask_image = np.where(binary, 0, 255).astype(np.uint8)
+    overlay = original.copy()
+    overlay[binary] = 0.55 * overlay[binary] + 0.45 * np.array([1.0, 0.0, 0.0])
+    mask_rgb = np.repeat(mask_image[..., None], 3, axis=2).astype(np.float32) / 255.0
+    panels = [转为PIL(original), 转为PIL(概率着色(probability)), 转为PIL(mask_rgb), 转为PIL(overlay)]
+    labels = ["原始钻孔图像", "Teacher裂缝概率", "二值裂缝Mask", "原图裂缝叠加"]
+    panel_width, panel_height, gap, label_height = 244, 1350, 20, 58
+    canvas = Image.new("RGB", (4 * panel_width + 5 * gap, panel_height + label_height), "white")
+    draw = ImageDraw.Draw(canvas)
+    font = 加载中文字体(17)
+    for index, (panel, label) in enumerate(zip(panels, labels)):
+        left = gap + index * (panel_width + gap)
+        canvas.paste(panel, (left, 0))
+        box = draw.textbbox((0, 0), label, font=font)
+        draw.text((left + (panel_width - (box[2] - box[0])) // 2, panel_height + 14), label, font=font, fill="#18222B")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path, format="PNG", optimize=True)
+
+
+def 运行阶段三() -> None:
+    """在真实无标签图像上执行合成监督约束下的EMA Teacher-Student自训练。"""
+
+    设置随机种子(配置.随机种子 + 300)
+    paths = 获取输入图像()
+    train_paths, validation_paths = paths[:8], paths[8:]
+    output = 配置.阶段三目录
+    output.mkdir(parents=True, exist_ok=True)
+    repair_model, student = 加载阶段二模型()
+    teacher = 轻量裂缝UNet(in_channels=4)
+    teacher.load_state_dict(student.state_dict())
+    teacher.eval()
+    for parameter in repair_model.parameters():
+        parameter.requires_grad_(False)
+    for parameter in teacher.parameters():
+        parameter.requires_grad_(False)
+
+    optimizer = torch.optim.AdamW(student.parameters(), lr=2.5e-4, weight_decay=1.0e-4)
+    real_generator = 在线合成批次(train_paths, 配置.随机种子 + 311)
+    synthetic_generator = 在线合成批次(train_paths, 配置.随机种子 + 313)
+    history: list[dict[str, float | int]] = []
+
+    for iteration in range(1, 配置.阶段三迭代次数 + 1):
+        real_images = 生成真实批次(real_generator, 配置.批大小)
+        weak = 弱增强(real_images)
+        strong = 强增强(real_images)
+        with torch.no_grad():
+            weak_repaired = repair_model(weak)
+            teacher_probabilities = torch.sigmoid(
+                teacher(构造修复引导输入(weak, weak_repaired))
+            )
+            residual = torch.mean(torch.abs(weak - weak_repaired), dim=1, keepdim=True)
+            pseudo_labels, valid_mask, pseudo_stats = 生成伪标签(teacher_probabilities, residual)
+            strong_repaired = repair_model(strong)
+
+        synthetic_images, _, synthetic_masks = synthetic_generator.生成修复批次(配置.批大小)
+        with torch.no_grad():
+            synthetic_repaired = repair_model(synthetic_images)
+        student.train()
+        optimizer.zero_grad(set_to_none=True)
+        supervised = 分割损失(
+            student(构造修复引导输入(synthetic_images, synthetic_repaired)),
+            synthetic_masks,
+        )
+        pseudo = 伪标签损失(
+            student(构造修复引导输入(strong, strong_repaired)),
+            pseudo_labels,
+            valid_mask,
+        )
+        ramp = min(1.0, iteration / max(1.0, 配置.阶段三迭代次数 * 0.35))
+        total = supervised + 0.35 * ramp * pseudo
+        total.backward()
+        nn.utils.clip_grad_norm_(student.parameters(), 5.0)
+        optimizer.step()
+        EMA更新(teacher, student, 配置.Teacher_EMA系数)
+        history.append(
+            {
+                "迭代次数": iteration,
+                "总损失": float(total.item()),
+                "合成监督损失": float(supervised.item()),
+                "真实伪标签损失": float(pseudo.item()),
+                **pseudo_stats,
+            }
+        )
+        if iteration == 1 or iteration % 20 == 0:
+            print(
+                f"阶段三迭代 {iteration:03d}/{配置.阶段三迭代次数}，"
+                f"总损失={total.item():.6f}，正伪标签={pseudo_stats['正伪标签比例']:.3%}"
+            )
+
+    torch.save({"模型参数": student.state_dict(), "输入通道": 4}, output / "阶段三_Student模型.pt")
+    torch.save(
+        {"模型参数": teacher.state_dict(), "输入通道": 4, "EMA系数": 配置.Teacher_EMA系数},
+        output / "阶段三_EMA-Teacher模型.pt",
+    )
+    counts, metrics = 验证修复引导分割器(
+        repair_model,
+        teacher,
+        在线合成批次(validation_paths, 配置.随机种子 + 229),
+        配置.阶段一验证样本数,
+    )
+    stage1 = json.loads((配置.阶段一目录 / "阶段一_合成验证指标.json").read_text(encoding="utf-8"))["指标"]
+    stage2_report = json.loads((配置.阶段二目录 / "阶段二_异常修复与分割指标.json").read_text(encoding="utf-8"))
+    stage2 = stage2_report["阶段二修复引导分割指标"]
+    report = {
+        "阶段": "阶段三_Teacher-Student自训练",
+        "说明": "真实图像只用于无标签一致性训练；下列F1仍为合成验证F1，不是独立真实审核F1。",
+        "EMA系数": 配置.Teacher_EMA系数,
+        "最终伪标签统计": {key: value for key, value in history[-1].items() if key not in {"迭代次数", "总损失", "合成监督损失", "真实伪标签损失"}},
+        "混淆统计": counts,
+        "合成验证指标": metrics,
+    }
+    保存JSON(report, output / "阶段三_Teacher-Student训练指标.json")
+    with (output / "阶段三_自训练逐迭代数据.csv").open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=list(history[0]))
+        writer.writeheader()
+        writer.writerows(history)
+    绘制自训练曲线(history, output / "阶段三_迭代次数损失与伪标签曲线.png")
+    绘制混淆矩阵(counts, output / "阶段三_EMA-Teacher合成验证混淆矩阵.png")
+    绘制三阶段指标对比(stage1, stage2, metrics, output / "阶段一至阶段三指标对比图.png")
+
+    probability_dir = output / "原图裂缝概率图"
+    mask_dir = output / "原图二值裂缝Mask"
+    overlay_dir = output / "原图裂缝叠加图"
+    comparison_dir = output / "原图识别四联对比图"
+    for directory in (probability_dir, mask_dir, overlay_dir, comparison_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    for path in paths:
+        original = 读取RGB(path)
+        probability = 滑窗预测整图(repair_model, teacher, original)
+        binary = probability >= 配置.二值阈值
+        mask = np.where(binary, 0, 255).astype(np.uint8)
+        overlay = original.copy()
+        overlay[binary] = 0.55 * overlay[binary] + 0.45 * np.array([1.0, 0.0, 0.0])
+        转为PIL(概率着色(probability)).save(probability_dir / f"{path.stem}_裂缝概率图.png")
+        Image.fromarray(mask, mode="L").save(mask_dir / f"{path.stem}_二值裂缝Mask.png")
+        转为PIL(overlay).save(overlay_dir / f"{path.stem}_裂缝叠加图.png")
+        保存最终预测对比(original, probability, comparison_dir / f"{path.stem}_裂缝识别四联对比图.png")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
 def 构建命令行() -> argparse.ArgumentParser:
     """构建分阶段命令行入口。"""
 
@@ -1018,6 +1368,7 @@ def 构建命令行() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("阶段一", help="运行合成裂缝监督阶段")
     subparsers.add_parser("阶段二", help="运行异常修复与修复引导分割阶段")
+    subparsers.add_parser("阶段三", help="运行Teacher-Student真实无标签自训练阶段")
     return parser
 
 
@@ -1027,6 +1378,8 @@ def main() -> None:
         运行阶段一()
     elif args.command == "阶段二":
         运行阶段二()
+    elif args.command == "阶段三":
+        运行阶段三()
 
 
 if __name__ == "__main__":
