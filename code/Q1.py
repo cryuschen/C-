@@ -47,6 +47,8 @@ class 项目配置:
     批大小: int = 4
     阶段一迭代次数: int = 120
     阶段一验证样本数: int = 48
+    阶段二修复迭代次数: int = 100
+    阶段二引导分割迭代次数: int = 80
     学习率: float = 1.0e-3
     二值阈值: float = 0.50
     有效区顶部: int = 24
@@ -62,6 +64,10 @@ class 项目配置:
     @property
     def 阶段一目录(self) -> Path:
         return self.输出根目录 / "阶段一_合成裂缝监督"
+
+    @property
+    def 阶段二目录(self) -> Path:
+        return self.输出根目录 / "阶段二_异常修复"
 
 
 配置 = 项目配置()
@@ -276,6 +282,24 @@ class 在线合成批次:
             masks.append(mask[None, ...])
         return torch.from_numpy(np.stack(images)), torch.from_numpy(np.stack(masks))
 
+    def 生成修复批次(self, batch_size: int) -> tuple[Tensor, Tensor, Tensor]:
+        """生成合成裂缝图、对应正常背景和精确Mask。"""
+
+        synthetic_images: list[np.ndarray] = []
+        clean_images: list[np.ndarray] = []
+        masks: list[np.ndarray] = []
+        for _ in range(batch_size):
+            clean, _, _, _ = self.获取图块()
+            synthetic, mask, _ = 合成裂缝样本(clean, self.rng)
+            synthetic_images.append(synthetic.transpose(2, 0, 1))
+            clean_images.append(clean.transpose(2, 0, 1))
+            masks.append(mask[None, ...])
+        return (
+            torch.from_numpy(np.stack(synthetic_images)),
+            torch.from_numpy(np.stack(clean_images)),
+            torch.from_numpy(np.stack(masks)),
+        )
+
 
 class 双卷积块(nn.Module):
     """两次卷积配合GroupNorm，适合CPU小批量训练。"""
@@ -323,6 +347,83 @@ class 轻量裂缝UNet(nn.Module):
         d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
         d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
         return self.head(d1)
+
+
+class 轻量修复UNet(nn.Module):
+    """把含合成裂缝的图块恢复为无裂缝岩壁背景。"""
+
+    def __init__(self, base: int = 8):
+        super().__init__()
+        self.enc1 = 双卷积块(3, base)
+        self.enc2 = 双卷积块(base, base * 2)
+        self.enc3 = 双卷积块(base * 2, base * 4)
+        self.bridge = 双卷积块(base * 4, base * 8)
+        self.pool = nn.MaxPool2d(2)
+        self.up3 = nn.ConvTranspose2d(base * 8, base * 4, 2, stride=2)
+        self.dec3 = 双卷积块(base * 8, base * 4)
+        self.up2 = nn.ConvTranspose2d(base * 4, base * 2, 2, stride=2)
+        self.dec2 = 双卷积块(base * 4, base * 2)
+        self.up1 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)
+        self.dec1 = 双卷积块(base * 2, base)
+        self.head = nn.Conv2d(base, 3, 1)
+        # 零初始化使网络训练开始时严格复制输入，之后只学习必要的局部残差。
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        bridge = self.bridge(self.pool(e3))
+        d3 = self.dec3(torch.cat([self.up3(bridge), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        residual = 0.35 * torch.tanh(self.head(d1))
+        return torch.clamp(x + residual, 0.0, 1.0)
+
+
+def 修复损失(repaired: Tensor, clean: Tensor, masks: Tensor) -> tuple[Tensor, dict[str, float]]:
+    """联合Mask内修复、Mask外恒等和梯度保持损失。"""
+
+    mask3 = masks.expand_as(repaired)
+    inside = (torch.abs(repaired - clean) * mask3).sum() / (mask3.sum() + 1.0)
+    outside_mask = 1.0 - mask3
+    outside = (torch.abs(repaired - clean) * outside_mask).sum() / (outside_mask.sum() + 1.0)
+    repaired_dx = repaired[:, :, :, 1:] - repaired[:, :, :, :-1]
+    clean_dx = clean[:, :, :, 1:] - clean[:, :, :, :-1]
+    repaired_dy = repaired[:, :, 1:, :] - repaired[:, :, :-1, :]
+    clean_dy = clean[:, :, 1:, :] - clean[:, :, :-1, :]
+    gradient = F.l1_loss(repaired_dx, clean_dx) + F.l1_loss(repaired_dy, clean_dy)
+    total = 4.0 * inside + 2.5 * outside + 0.35 * gradient
+    return total, {
+        "Mask内MAE": float(inside.item()),
+        "Mask外MAE": float(outside.item()),
+        "梯度损失": float(gradient.item()),
+    }
+
+
+def 构造修复引导输入(images: Tensor, repaired: Tensor) -> Tensor:
+    """把RGB原图与单通道修复差异拼成四通道分割输入。"""
+
+    residual = torch.mean(torch.abs(images - repaired), dim=1, keepdim=True)
+    return torch.cat([images, residual], dim=1)
+
+
+def 从三通道模型初始化四通道模型(checkpoint_path: Path) -> 轻量裂缝UNet:
+    """保留阶段一全部参数，并把新增残差通道初始权重设为零。"""
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    source = checkpoint["模型参数"]
+    model = 轻量裂缝UNet(in_channels=4)
+    target = model.state_dict()
+    for key, value in source.items():
+        if key == "enc1.layers.0.weight":
+            target[key][:, :3] = value
+            target[key][:, 3:] = 0.0
+        elif key in target and target[key].shape == value.shape:
+            target[key] = value
+    model.load_state_dict(target)
+    return model
 
 
 def 分割损失(logits: Tensor, targets: Tensor) -> Tensor:
@@ -634,12 +735,289 @@ def 运行阶段一() -> None:
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
+def 评估修复网络(
+    model: 轻量修复UNet,
+    generator: 在线合成批次,
+    sample_count: int,
+) -> dict[str, float]:
+    """在独立背景上统计修复网络的Mask内/外误差和全图PSNR。"""
+
+    model.eval()
+    inside_error = 0.0
+    outside_error = 0.0
+    inside_pixels = 0.0
+    outside_pixels = 0.0
+    squared_error = 0.0
+    value_count = 0
+    remaining = sample_count
+    with torch.no_grad():
+        while remaining > 0:
+            batch = min(配置.批大小, remaining)
+            synthetic, clean, masks = generator.生成修复批次(batch)
+            repaired = model(synthetic)
+            mask3 = masks.expand_as(repaired)
+            inside_error += float((torch.abs(repaired - clean) * mask3).sum().item())
+            outside_error += float((torch.abs(repaired - clean) * (1.0 - mask3)).sum().item())
+            inside_pixels += float(mask3.sum().item())
+            outside_pixels += float((1.0 - mask3).sum().item())
+            squared_error += float(F.mse_loss(repaired, clean, reduction="sum").item())
+            value_count += repaired.numel()
+            remaining -= batch
+    mse = squared_error / max(value_count, 1)
+    return {
+        "Mask内平均绝对误差": inside_error / max(inside_pixels, 1.0),
+        "Mask外平均绝对误差": outside_error / max(outside_pixels, 1.0),
+        "全图均方误差": mse,
+        "全图峰值信噪比PSNR": -10.0 * math.log10(max(mse, 1.0e-12)),
+    }
+
+
+def 验证修复引导分割器(
+    repair_model: 轻量修复UNet,
+    segmentation_model: 轻量裂缝UNet,
+    generator: 在线合成批次,
+    sample_count: int,
+) -> tuple[dict[str, int], dict[str, float]]:
+    """以修复残差为第四通道，计算相同定义的合成验证指标。"""
+
+    repair_model.eval()
+    segmentation_model.eval()
+    counts = {"TP": 0, "FP": 0, "FN": 0, "TN": 0}
+    remaining = sample_count
+    with torch.no_grad():
+        while remaining > 0:
+            batch = min(配置.批大小, remaining)
+            images, _, masks = generator.生成修复批次(batch)
+            repaired = repair_model(images)
+            probabilities = torch.sigmoid(
+                segmentation_model(构造修复引导输入(images, repaired))
+            ).cpu().numpy()
+            current = 混淆统计(probabilities, masks.numpy(), 配置.二值阈值)
+            for key in counts:
+                counts[key] += current[key]
+            remaining -= batch
+    return counts, 由混淆统计计算指标(counts)
+
+
+def 绘制双损失曲线(rows: Sequence[dict[str, float | int]], path: Path) -> None:
+    """绘制修复网络总损失、Mask内误差和Mask外误差。"""
+
+    x = [int(row["迭代次数"]) for row in rows]
+    fig, ax = plt.subplots(figsize=(8.4, 4.9), dpi=150)
+    ax.plot(x, [float(row["修复总损失"]) for row in rows], color="#2F6B9A", label="修复总损失")
+    ax.plot(x, [float(row["Mask内MAE"]) for row in rows], color="#D39C2C", label="Mask内MAE")
+    ax.plot(x, [float(row["Mask外MAE"]) for row in rows], color="#6B7280", label="Mask外MAE")
+    ax.set_title("阶段二异常修复训练曲线")
+    ax.set_xlabel("迭代次数")
+    ax.set_ylabel("损失或平均绝对误差")
+    ax.grid(axis="y", color="#D9DEE3", linewidth=0.7)
+    ax.legend(frameon=False, ncol=3)
+    fig.text(0.5, 0.01, "Mask内衡量裂缝清除；Mask外衡量正常岩壁保持", ha="center", fontsize=9)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def 绘制阶段指标对比(
+    baseline: dict[str, float], guided: dict[str, float], path: Path
+) -> None:
+    """用分组柱状图比较阶段一与修复引导分割指标。"""
+
+    names = ["精确率", "召回率", "F1", "IoU"]
+    keys = ["精确率Precision", "召回率Recall", "F1分数", "交并比IoU"]
+    x = np.arange(len(names))
+    width = 0.34
+    fig, ax = plt.subplots(figsize=(8.2, 4.9), dpi=150)
+    bars1 = ax.bar(x - width / 2, [baseline[key] for key in keys], width, label="阶段一合成监督", color="#AFC8DA", edgecolor="#2F6B9A")
+    bars2 = ax.bar(x + width / 2, [guided[key] for key in keys], width, label="阶段二修复引导", color="#D39C2C", edgecolor="#8A6415")
+    ax.set_xticks(x, names)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("指标值")
+    ax.set_title("异常修复证据加入前后的合成验证指标")
+    ax.grid(axis="y", color="#D9DEE3", linewidth=0.7)
+    ax.legend(frameon=False)
+    for bars in (bars1, bars2):
+        for bar in bars:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.018, f"{bar.get_height():.3f}", ha="center", fontsize=8)
+    fig.text(0.5, 0.01, "相同验证原图、样本数与二值阈值；仅比较模型输入证据变化", ha="center", fontsize=9)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def 滑窗修复整图(model: 轻量修复UNet, image: np.ndarray) -> np.ndarray:
+    """横向循环、纵向重叠滑窗修复整张244×1350原图。"""
+
+    size = 配置.图块尺寸
+    stride = size // 2
+    height, width = image.shape[:2]
+    y_starts = list(range(0, max(1, height - size + 1), stride))
+    if not y_starts or y_starts[-1] != height - size:
+        y_starts.append(height - size)
+    x_starts = list(range(0, width, stride))
+    accumulator = np.zeros_like(image, dtype=np.float32)
+    weights = np.zeros((height, width, 1), dtype=np.float32)
+    model.eval()
+    with torch.no_grad():
+        for y0 in y_starts:
+            for x0 in x_starts:
+                patch = 循环裁剪图块(image, x0, y0, size)
+                tensor = torch.from_numpy(patch.transpose(2, 0, 1)[None])
+                repaired = model(tensor)[0].cpu().numpy().transpose(1, 2, 0)
+                for local_x in range(size):
+                    global_x = (x0 + local_x) % width
+                    accumulator[y0 : y0 + size, global_x] += repaired[:, local_x]
+                    weights[y0 : y0 + size, global_x] += 1.0
+    result = accumulator / np.maximum(weights, 1.0)
+    # 标题/方位标记区不参与修复，保持与原图完全一致。
+    result[: 配置.有效区顶部] = image[: 配置.有效区顶部]
+    return np.clip(result, 0.0, 1.0)
+
+
+def 残差着色(residual: np.ndarray) -> np.ndarray:
+    """将0～1残差映射为黑—橙—白，便于观察修复修改位置。"""
+
+    value = np.clip(residual * 6.0, 0.0, 1.0)
+    rgb = np.zeros((*value.shape, 3), dtype=np.float32)
+    rgb[..., 0] = np.clip(value * 1.5, 0.0, 1.0)
+    rgb[..., 1] = np.clip((value - 0.25) * 1.2, 0.0, 0.75)
+    rgb[..., 2] = np.clip((value - 0.65) * 2.0, 0.0, 1.0)
+    return rgb
+
+
+def 保存修复整图对比(original: np.ndarray, repaired: np.ndarray, path: Path) -> None:
+    """输出原图、修复图和差异放大图三联图。"""
+
+    residual = np.mean(np.abs(original - repaired), axis=2)
+    panels = [转为PIL(original), 转为PIL(repaired), 转为PIL(残差着色(residual))]
+    labels = ["原始钻孔图像", "异常修复图像", "修复差异热力图（放大6倍）"]
+    panel_width = 244
+    panel_height = 1350
+    gap = 22
+    label_height = 58
+    canvas = Image.new("RGB", (3 * panel_width + 4 * gap, panel_height + label_height), "white")
+    draw = ImageDraw.Draw(canvas)
+    font = 加载中文字体(18)
+    for index, (panel, label) in enumerate(zip(panels, labels)):
+        left = gap + index * (panel_width + gap)
+        canvas.paste(panel, (left, 0))
+        box = draw.textbbox((0, 0), label, font=font)
+        draw.text((left + (panel_width - (box[2] - box[0])) // 2, panel_height + 14), label, font=font, fill="#18222B")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path, format="PNG", optimize=True)
+
+
+def 运行阶段二() -> None:
+    """训练异常修复网络、修复引导分割器并输出全图对比结果。"""
+
+    设置随机种子(配置.随机种子 + 200)
+    paths = 获取输入图像()
+    train_paths, validation_paths = paths[:8], paths[8:]
+    output = 配置.阶段二目录
+    output.mkdir(parents=True, exist_ok=True)
+    train_generator = 在线合成批次(train_paths, 配置.随机种子 + 211)
+    repair_model = 轻量修复UNet()
+    optimizer = torch.optim.AdamW(repair_model.parameters(), lr=配置.学习率, weight_decay=1.0e-4)
+    repair_history: list[dict[str, float | int]] = []
+
+    repair_model.train()
+    for iteration in range(1, 配置.阶段二修复迭代次数 + 1):
+        synthetic, clean, masks = train_generator.生成修复批次(配置.批大小)
+        optimizer.zero_grad(set_to_none=True)
+        repaired = repair_model(synthetic)
+        loss, components = 修复损失(repaired, clean, masks)
+        loss.backward()
+        nn.utils.clip_grad_norm_(repair_model.parameters(), 5.0)
+        optimizer.step()
+        repair_history.append({"迭代次数": iteration, "修复总损失": float(loss.item()), **components})
+        if iteration == 1 or iteration % 20 == 0:
+            print(f"阶段二修复迭代 {iteration:03d}/{配置.阶段二修复迭代次数}，损失={loss.item():.6f}")
+
+    repair_checkpoint = output / "阶段二_异常修复模型.pt"
+    torch.save({"模型参数": repair_model.state_dict(), "配置": asdict(配置)}, repair_checkpoint)
+    repair_metrics = 评估修复网络(
+        repair_model,
+        在线合成批次(validation_paths, 配置.随机种子 + 229),
+        配置.阶段一验证样本数,
+    )
+
+    segmentation_model = 从三通道模型初始化四通道模型(
+        配置.阶段一目录 / "阶段一_合成监督模型.pt"
+    )
+    segmentation_optimizer = torch.optim.AdamW(segmentation_model.parameters(), lr=4.0e-4, weight_decay=1.0e-4)
+    guided_history: list[dict[str, float | int]] = []
+    repair_model.eval()
+    segmentation_model.train()
+    for iteration in range(1, 配置.阶段二引导分割迭代次数 + 1):
+        images, _, masks = train_generator.生成修复批次(配置.批大小)
+        with torch.no_grad():
+            repaired = repair_model(images)
+        segmentation_optimizer.zero_grad(set_to_none=True)
+        loss = 分割损失(segmentation_model(构造修复引导输入(images, repaired)), masks)
+        loss.backward()
+        nn.utils.clip_grad_norm_(segmentation_model.parameters(), 5.0)
+        segmentation_optimizer.step()
+        guided_history.append({"迭代次数": iteration, "训练损失": float(loss.item())})
+        if iteration == 1 or iteration % 20 == 0:
+            print(f"阶段二引导分割迭代 {iteration:03d}/{配置.阶段二引导分割迭代次数}，损失={loss.item():.6f}")
+
+    torch.save(
+        {"模型参数": segmentation_model.state_dict(), "输入通道": 4, "配置": asdict(配置)},
+        output / "阶段二_修复引导分割模型.pt",
+    )
+    guided_counts, guided_metrics = 验证修复引导分割器(
+        repair_model,
+        segmentation_model,
+        在线合成批次(validation_paths, 配置.随机种子 + 229),
+        配置.阶段一验证样本数,
+    )
+    baseline_report = json.loads(
+        (配置.阶段一目录 / "阶段一_合成验证指标.json").read_text(encoding="utf-8")
+    )
+    report = {
+        "阶段": "阶段二_异常修复",
+        "说明": "修复指标与引导分割指标均基于独立背景上的合成裂缝；真实指标留待阶段四审核集。",
+        "修复指标": repair_metrics,
+        "阶段一分割指标": baseline_report["指标"],
+        "阶段二修复引导分割混淆统计": guided_counts,
+        "阶段二修复引导分割指标": guided_metrics,
+    }
+    保存JSON(report, output / "阶段二_异常修复与分割指标.json")
+    with (output / "阶段二_修复训练日志.csv").open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=list(repair_history[0]))
+        writer.writeheader()
+        writer.writerows(repair_history)
+    保存训练日志(guided_history, output / "阶段二_引导分割训练损失.csv")
+    绘制双损失曲线(repair_history, output / "阶段二_异常修复迭代与损失曲线.png")
+    绘制损失曲线(guided_history, output / "阶段二_引导分割迭代与损失曲线.png")
+    绘制混淆矩阵(guided_counts, output / "阶段二_修复引导分割混淆矩阵.png")
+    绘制阶段指标对比(
+        baseline_report["指标"], guided_metrics, output / "阶段一与阶段二指标对比图.png"
+    )
+
+    repaired_dir = output / "原图异常修复结果"
+    comparison_dir = output / "原图修复对比图"
+    residual_dir = output / "原图修复差异图"
+    for path in paths:
+        original = 读取RGB(path)
+        repaired = 滑窗修复整图(repair_model, original)
+        residual = np.mean(np.abs(original - repaired), axis=2)
+        repaired_dir.mkdir(parents=True, exist_ok=True)
+        residual_dir.mkdir(parents=True, exist_ok=True)
+        转为PIL(repaired).save(repaired_dir / f"{path.stem}_异常修复图.png")
+        转为PIL(残差着色(residual)).save(residual_dir / f"{path.stem}_修复差异热力图.png")
+        保存修复整图对比(original, repaired, comparison_dir / f"{path.stem}_异常修复三联对比图.png")
+
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
 def 构建命令行() -> argparse.ArgumentParser:
     """构建分阶段命令行入口。"""
 
     parser = argparse.ArgumentParser(description="附件1裂缝识别四阶段流水线")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("阶段一", help="运行合成裂缝监督阶段")
+    subparsers.add_parser("阶段二", help="运行异常修复与修复引导分割阶段")
     return parser
 
 
@@ -647,6 +1025,8 @@ def main() -> None:
     args = 构建命令行().parse_args()
     if args.command == "阶段一":
         运行阶段一()
+    elif args.command == "阶段二":
+        运行阶段二()
 
 
 if __name__ == "__main__":
